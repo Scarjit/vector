@@ -3,7 +3,7 @@ use std::{collections::VecDeque, fmt, future::poll_fn, task::Poll};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, poll};
 use tokio::{pin, select};
 use tower::Service;
-use tracing::Instrument;
+use tracing::{Instrument, debug, info, trace, warn};
 use vector_common::{
     internal_event::{
         ByteSize, BytesSent, CallError, InternalEventHandle as _, PollReadyError, Registered,
@@ -105,6 +105,8 @@ where
         let bytes_sent = protocol.map(|protocol| register(BytesSent { protocol }));
         let events_sent = RegisteredEventCache::new(());
 
+        debug!(message = "Driver: starting run loop.");
+
         loop {
             // Core behavior of the loop:
             // - always check to see if we have any response futures that have completed
@@ -132,15 +134,34 @@ where
                 biased;
 
                 // One or more of our service calls have completed.
-                Some(_count) = in_flight.next(), if !in_flight.is_empty() => {}
+                Some(_count) = in_flight.next(), if !in_flight.is_empty() => {
+                    trace!(
+                        message = "Driver: in-flight request(s) completed.",
+                        remaining_in_flight = in_flight.len(),
+                        has_next_batch = next_batch.is_some(),
+                        has_overflow_batch = overflow_batch.is_some(),
+                    );
+                }
 
                 // We've got an input batch to process and the service is ready to accept a request.
                 maybe_ready = poll_fn(|cx| service.poll_ready(cx)), if next_batch.is_some() => {
                     let mut batch = next_batch.take()
                         .unwrap_or_else(|| unreachable!("batch should be populated"));
 
+                    debug!(
+                        message = "Driver: service ready, processing batch.",
+                        batch_size = batch.len(),
+                        in_flight = in_flight.len(),
+                        has_overflow_batch = overflow_batch.is_some(),
+                    );
+
                     let mut maybe_ready = Some(maybe_ready);
                     while !batch.is_empty() {
+                        trace!(
+                            message = "Driver: draining batch, polling service readiness.",
+                            remaining_in_batch = batch.len(),
+                            in_flight = in_flight.len(),
+                        );
                         // Make sure the service is ready to take another request.
                         let maybe_ready = match maybe_ready.take() {
                             Some(ready) => Poll::Ready(ready),
@@ -148,12 +169,20 @@ where
                         };
 
                         let svc = match maybe_ready {
-                            Poll::Ready(Ok(())) => &mut service,
+                            Poll::Ready(Ok(())) => {
+                                trace!(message = "Driver: service ready for next request.");
+                                &mut service
+                            }
                             Poll::Ready(Err(error)) => {
+                                warn!(message = "Driver: service poll_ready returned error, aborting.");
                                 emit(PollReadyError{ error });
                                 return Err(())
                             }
                             Poll::Pending => {
+                                debug!(
+                                    message = "Driver: service not ready, requeueing remaining batch.",
+                                    remaining_in_batch = batch.len(),
+                                );
                                 next_batch = Some(batch);
                                 break
                             },
@@ -191,6 +220,9 @@ where
                     // Batch fully drained — promote overflow into the primary slot so the
                     // next iteration can send it and branch 3 becomes re-enabled.
                     if next_batch.is_none() {
+                        if overflow_batch.is_some() {
+                            debug!(message = "Driver: primary batch fully drained, promoting overflow batch.");
+                        }
                         next_batch = overflow_batch.take();
                     }
                 }
@@ -201,13 +233,29 @@ where
                 Some(reqs) = batched_input.next(), if overflow_batch.is_none() => {
                     let batch: VecDeque<St::Item> = reqs.into();
                     if next_batch.is_none() {
+                        debug!(
+                            message = "Driver: received new batch from input stream.",
+                            batch_size = batch.len(),
+                            in_flight = in_flight.len(),
+                        );
                         next_batch = Some(batch);
                     } else {
+                        debug!(
+                            message = "Driver: next_batch occupied, storing new batch in overflow slot.",
+                            batch_size = batch.len(),
+                            in_flight = in_flight.len(),
+                        );
                         overflow_batch = Some(batch);
                     }
                 }
 
-                else => break
+                else => {
+                    info!(
+                        message = "Driver: input stream exhausted, exiting run loop.",
+                        in_flight = in_flight.len(),
+                    );
+                    break;
+                }
             }
         }
 
@@ -222,27 +270,60 @@ where
         bytes_sent: Option<&Registered<BytesSent>>,
         events_sent: &RegisteredEventCache<(), TaggedEventsSent>,
     ) {
+        trace!(
+            message = "Driver: handling service response.",
+            request_id,
+            event_count,
+        );
         match result {
             Err(error) => {
+                warn!(
+                    message = "Driver: service call returned error, rejecting events.",
+                    request_id,
+                    event_count,
+                );
                 Self::emit_call_error(Some(error), request_id, event_count);
                 finalizers.update_status(EventStatus::Rejected);
             }
             Ok(response) => {
-                trace!(message = "Service call succeeded.", request_id);
-                finalizers.update_status(response.event_status());
-                if response.event_status() == EventStatus::Delivered {
+                let status = response.event_status();
+                trace!(message = "Service call succeeded.", request_id, ?status);
+                finalizers.update_status(status);
+                if status == EventStatus::Delivered {
+                    debug!(
+                        message = "Driver: request delivered successfully.",
+                        request_id,
+                        event_count,
+                    );
                     if let Some(bytes_sent) = bytes_sent
                         && let Some(byte_size) = response.bytes_sent()
                     {
+                        trace!(
+                            message = "Driver: emitting bytes_sent.",
+                            request_id,
+                            byte_size,
+                        );
                         bytes_sent.emit(ByteSize(byte_size));
                     }
 
                     response.events_sent().emit_event(events_sent);
 
                 // This condition occurs specifically when the `HttpBatchService::call()` is called *within* the `Service::call()`
-                } else if response.event_status() == EventStatus::Rejected {
+                } else if status == EventStatus::Rejected {
+                    warn!(
+                        message = "Driver: request rejected by service (inner HttpBatchService path), dropping events.",
+                        request_id,
+                        event_count,
+                    );
                     Self::emit_call_error(None, request_id, event_count);
                     finalizers.update_status(EventStatus::Rejected);
+                } else {
+                    debug!(
+                        message = "Driver: request completed with non-delivered status.",
+                        request_id,
+                        event_count,
+                        ?status,
+                    );
                 }
             }
         }

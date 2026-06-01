@@ -1,6 +1,7 @@
 use std::{fmt, hash::Hash};
 
 use vector_lib::{event::Event, partition::Partitioner};
+use tracing::{debug, trace, warn};
 
 use super::partitioner::S3PartitionKey;
 use crate::sinks::prelude::*;
@@ -46,11 +47,35 @@ where
         let settings = self.batcher_settings;
         let request_builder = self.request_builder;
 
+        debug!(message = "S3Sink: starting pipeline.");
+
         input
             .batched_partitioned(partitioner, settings.timeout, |_| {
                 settings.as_byte_size_config()
             })
-            .filter_map(|(key, batch)| async move { key.map(move |k| (k, batch)) })
+            .inspect(|(key, batch)| {
+                trace!(
+                    message = "S3Sink: batch ready from partitioned batcher.",
+                    has_key = key.is_some(),
+                    batch_len = batch.len(),
+                );
+            })
+            .filter_map(|(key, batch)| async move {
+                if key.is_none() {
+                    warn!(
+                        message = "S3Sink: dropping batch with None partition key.",
+                        batch_len = batch.len(),
+                    );
+                }
+                key.map(move |k| (k, batch))
+            })
+            .inspect(|(key, batch)| {
+                debug!(
+                    message = "S3Sink: building request for batch.",
+                    key_prefix = %key.key_prefix,
+                    batch_len = batch.len(),
+                );
+            })
             .request_builder(default_request_builder_concurrency_limit(), request_builder)
             .filter_map(|request| async move {
                 match request {
@@ -58,7 +83,10 @@ where
                         emit!(SinkRequestBuildError { error });
                         None
                     }
-                    Ok(req) => Some(req),
+                    Ok(req) => {
+                        trace!(message = "S3Sink: request built successfully, handing to driver.");
+                        Some(req)
+                    }
                 }
             })
             .into_driver(self.service)

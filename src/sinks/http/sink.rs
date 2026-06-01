@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use tracing::{debug, trace, warn};
+
 use super::{batch::HttpBatchSizer, request_builder::HttpRequestBuilder};
 use crate::sinks::{prelude::*, util::http::HttpRequest};
 
@@ -41,6 +43,9 @@ where
         let batch_sizer = HttpBatchSizer {
             encoder: self.request_builder.encoder.encoder.clone(),
         };
+
+        debug!(message = "HttpSink: starting pipeline.");
+
         input
             // Batch the input stream with size calculation based on the configured codec
             .batched_partitioned(
@@ -48,7 +53,29 @@ where
                 self.batch_settings.timeout,
                 |_| self.batch_settings.as_item_size_config(batch_sizer.clone()),
             )
-            .filter_map(|(key, batch)| async move { key.map(move |k| (k, batch)) })
+            .inspect(|(key, batch)| {
+                trace!(
+                    message = "HttpSink: batch ready from partitioned batcher.",
+                    has_key = key.is_some(),
+                    batch_len = batch.len(),
+                );
+            })
+            .filter_map(|(key, batch)| async move {
+                if key.is_none() {
+                    warn!(
+                        message = "HttpSink: dropping batch with None partition key (template render error).",
+                        batch_len = batch.len(),
+                    );
+                }
+                key.map(move |k| (k, batch))
+            })
+            .inspect(|(key, batch)| {
+                debug!(
+                    message = "HttpSink: building request for batch.",
+                    uri = %key.uri,
+                    batch_len = batch.len(),
+                );
+            })
             // Build requests with default concurrency limit.
             .request_builder(
                 default_request_builder_concurrency_limit(),
@@ -61,7 +88,10 @@ where
                         emit!(SinkRequestBuildError { error });
                         None
                     }
-                    Ok(req) => Some(req),
+                    Ok(req) => {
+                        trace!(message = "HttpSink: request built successfully, handing to driver.");
+                        Some(req)
+                    }
                 }
             })
             // Generate the driver that will send requests and handle retries,

@@ -124,7 +124,20 @@ impl Service<S3Request> for S3Service {
 
         let client = self.client.clone();
 
+        debug!(
+            message = "S3Service: dispatching PutObject request.",
+            bucket = %request.bucket,
+            key = %request.metadata.s3_key,
+            body_bytes = request.body.len(),
+        );
+
         Box::pin(async move {
+            trace!(
+                message = "S3Service: awaiting PutObject response.",
+                bucket = %request.bucket,
+                key = %request.metadata.s3_key,
+            );
+
             let put_request = client
                 .put_object()
                 .body(bytes_to_bytestream(request.body))
@@ -145,16 +158,26 @@ impl Service<S3Request> for S3Service {
 
             let result = put_request.send().in_current_span().await;
 
-            result.map(|_| {
-                trace!(
-                    target: "vector::sinks::s3_common::service::put_object",
-                    message = "Put object to s3-compatible storage.",
-                    bucket = request.bucket,
-                    key = request.metadata.s3_key
-                );
-
-                S3Response { events_byte_size }
-            })
+            match result {
+                Ok(_) => {
+                    trace!(
+                        target: "vector::sinks::s3_common::service::put_object",
+                        message = "Put object to s3-compatible storage.",
+                        bucket = request.bucket,
+                        key = request.metadata.s3_key
+                    );
+                    Ok(S3Response { events_byte_size })
+                }
+                Err(ref e) => {
+                    tracing::warn!(
+                        message = "S3Service: PutObject failed.",
+                        bucket = %request.bucket,
+                        key = %request.metadata.s3_key,
+                        error = %e,
+                    );
+                    result.map(|_| S3Response { events_byte_size })
+                }
+            }
         })
     }
 }

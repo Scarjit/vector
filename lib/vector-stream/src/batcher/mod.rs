@@ -4,7 +4,7 @@ pub mod limiter;
 
 use std::{
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
 };
 
 pub use config::BatchConfig;
@@ -14,6 +14,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::time::Sleep;
+use tracing::{debug, trace};
 
 #[pin_project]
 pub struct Batcher<S, C> {
@@ -58,30 +59,59 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             let mut this = self.as_mut().project();
+            trace!(message = "Batcher: polling inner stream.", batch_len = this.state.len());
             match this.stream.poll_next(cx) {
                 Poll::Ready(None) => {
+                    trace!(message = "Batcher: inner stream closed.");
                     return {
                         if this.state.len() == 0 {
+                            debug!(message = "Batcher: stream closed, no pending items. Finishing.");
                             Poll::Ready(None)
                         } else {
+                            debug!(
+                                message = "Batcher: stream closed, flushing remaining batch.",
+                                batch_len = this.state.len(),
+                            );
                             Poll::Ready(Some(this.state.take_batch()))
                         }
                     };
                 }
                 Poll::Ready(Some(item)) => {
                     let (item_fits, item_metadata) = this.state.item_fits_in_batch(&item);
+                    trace!(
+                        message = "Batcher: received item from stream.",
+                        item_fits,
+                        current_batch_len = this.state.len(),
+                    );
                     if item_fits {
                         this.state.push(item, item_metadata);
+                        trace!(message = "Batcher: item pushed.", new_batch_len = this.state.len());
                         if this.state.is_batch_full() {
+                            debug!(
+                                message = "Batcher: batch full after push, emitting batch.",
+                                batch_len = this.state.len(),
+                            );
                             this.timer.set(Maybe::None);
                             return Poll::Ready(Some(this.state.take_batch()));
                         } else if this.state.len() == 1 {
+                            debug!(
+                                message = "Batcher: first item in batch, starting timeout.",
+                                timeout = ?this.state.timeout(),
+                            );
                             this.timer
                                 .set(Maybe::Some(tokio::time::sleep(this.state.timeout())));
                         }
                     } else {
+                        debug!(
+                            message = "Batcher: item does not fit, emitting current batch and starting new one.",
+                            current_batch_len = this.state.len(),
+                        );
                         let output = Poll::Ready(Some(this.state.take_batch()));
                         this.state.push(item, item_metadata);
+                        trace!(
+                            message = "Batcher: item pushed into new batch, resetting timer.",
+                            timeout = ?this.state.timeout(),
+                        );
                         this.timer
                             .set(Maybe::Some(tokio::time::sleep(this.state.timeout())));
                         // Poll the new timer immediately so its waker is registered with
@@ -96,16 +126,33 @@ where
                     }
                 }
                 Poll::Pending => {
+                    trace!(
+                        message = "Batcher: inner stream pending.",
+                        batch_len = this.state.len(),
+                        has_timer = matches!(*this.timer.as_ref(), Maybe::Some(_)),
+                    );
                     return {
                         if let MaybeProj::Some(timer) = this.timer.as_mut().project() {
-                            ready!(timer.poll(cx));
-                            this.timer.set(Maybe::None);
-                            debug_assert!(
-                                this.state.len() != 0,
-                                "timer should have been cancelled"
-                            );
-                            Poll::Ready(Some(this.state.take_batch()))
+                            match timer.poll(cx) {
+                                Poll::Ready(()) => {
+                                    debug!(
+                                        message = "Batcher: timeout fired, emitting batch.",
+                                        batch_len = this.state.len(),
+                                    );
+                                    this.timer.set(Maybe::None);
+                                    debug_assert!(
+                                        this.state.len() != 0,
+                                        "timer should have been cancelled"
+                                    );
+                                    Poll::Ready(Some(this.state.take_batch()))
+                                }
+                                Poll::Pending => {
+                                    trace!(message = "Batcher: timer still pending, waiting.");
+                                    Poll::Pending
+                                }
+                            }
                         } else {
+                            trace!(message = "Batcher: no timer and stream pending, parking.");
                             Poll::Pending
                         }
                     };

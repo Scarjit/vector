@@ -10,6 +10,7 @@ use std::{
 use futures::stream::{Fuse, Stream, StreamExt};
 use pin_project::pin_project;
 use tokio_util::time::{DelayQueue, delay_queue::Key};
+use tracing::{debug, trace};
 use twox_hash::XxHash64;
 use vector_common::byte_size_of::ByteSizeOf;
 use vector_core::{partition::Partitioner, time::KeyedTimer};
@@ -266,40 +267,69 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         loop {
+            trace!(
+                message = "PartitionedBatcher: loop iteration.",
+                open_partitions = this.batches.len(),
+                closed_batches = this.closed_batches.len(),
+            );
             if !this.closed_batches.is_empty() {
+                trace!(
+                    message = "PartitionedBatcher: closed_batches non-empty, polling timer before flush.",
+                    closed_batches = this.closed_batches.len(),
+                );
                 // Poll the timer so its waker is registered even when returning early.
                 // Without this, a timer reset in the !fits path fires with no waker
                 // and the lone batch stalls until the next event.
                 match this.timer.poll_expired(cx) {
                     Poll::Ready(Some(item_key)) => {
+                        debug!(message = "PartitionedBatcher: timer expired for partition during closed-batch flush.");
                         if let Some(mut batch) = this.batches.remove(&item_key) {
                             this.closed_batches.push((item_key, batch.take_batch()));
                         }
                     }
                     Poll::Pending | Poll::Ready(None) => {}
                 }
+                debug!(
+                    message = "PartitionedBatcher: emitting closed batch.",
+                    remaining_closed = this.closed_batches.len().saturating_sub(1),
+                );
                 return Poll::Ready(this.closed_batches.pop());
             }
             match this.stream.as_mut().poll_next(cx) {
-                Poll::Pending => match this.timer.poll_expired(cx) {
-                    // Unlike normal streams, `DelayQueue` can return `None`
-                    // here but still be usable later if more entries are added.
-                    Poll::Pending | Poll::Ready(None) => return Poll::Pending,
-                    Poll::Ready(Some(item_key)) => {
-                        let mut batch = this
-                            .batches
-                            .remove(&item_key)
-                            .expect("batch should exist if it is set to expire");
-                        this.closed_batches.push((item_key, batch.take_batch()));
+                Poll::Pending => {
+                    trace!(message = "PartitionedBatcher: inner stream pending, polling expiration timer.");
+                    match this.timer.poll_expired(cx) {
+                        // Unlike normal streams, `DelayQueue` can return `None`
+                        // here but still be usable later if more entries are added.
+                        Poll::Pending | Poll::Ready(None) => {
+                            trace!(message = "PartitionedBatcher: no expired partitions, parking.");
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Some(item_key)) => {
+                            debug!(
+                                message = "PartitionedBatcher: partition timeout expired, closing batch.",
+                                open_partitions = this.batches.len(),
+                            );
+                            let mut batch = this
+                                .batches
+                                .remove(&item_key)
+                                .expect("batch should exist if it is set to expire");
+                            this.closed_batches.push((item_key, batch.take_batch()));
+                        }
                     }
-                },
+                }
                 Poll::Ready(None) => {
+                    trace!(message = "PartitionedBatcher: inner stream closed.");
                     // Now that the underlying stream is closed, we need to
                     // clear out our batches, including all expiration
                     // entries. If we had any batches to hand over, we have to
                     // continue looping so the caller can drain them all before
                     // we finish.
                     if !this.batches.is_empty() {
+                        debug!(
+                            message = "PartitionedBatcher: stream closed, draining remaining partitions.",
+                            remaining_partitions = this.batches.len(),
+                        );
                         this.timer.clear();
                         this.closed_batches.extend(
                             this.batches
@@ -308,15 +338,27 @@ where
                         );
                         continue;
                     }
+                    debug!(message = "PartitionedBatcher: all partitions drained, finishing.");
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(item)) => {
                     let item_key = this.partitioner.partition(&item);
+                    let is_new_partition = !this.batches.contains_key(&item_key);
+
+                    trace!(
+                        message = "PartitionedBatcher: received item.",
+                        is_new_partition,
+                        open_partitions = this.batches.len(),
+                    );
 
                     // Get the batch for this partition, or create a new one.
                     let batch = if let Some(batch) = this.batches.get_mut(&item_key) {
                         batch
                     } else {
+                        debug!(
+                            message = "PartitionedBatcher: new partition opened, starting expiration timer.",
+                            open_partitions = this.batches.len() + 1,
+                        );
                         let batch = (this.state)(&item_key);
                         this.batches.insert(item_key.clone(), batch);
                         this.timer.insert(item_key.clone());
@@ -326,7 +368,16 @@ where
                     };
 
                     let (fits, metadata) = batch.item_fits_in_batch(&item);
+                    trace!(
+                        message = "PartitionedBatcher: item fit check.",
+                        fits,
+                        current_batch_len = batch.len(),
+                    );
                     if !fits {
+                        debug!(
+                            message = "PartitionedBatcher: item does not fit, closing current partition batch and resetting timer.",
+                            batch_len = batch.len(),
+                        );
                         // This batch is too full to accept a new item, so we move the contents of
                         // the batch into `closed_batches` to be push out of this stream on the
                         // next iteration.
@@ -341,7 +392,16 @@ where
 
                     // Insert the item into the batch.
                     batch.push(item, metadata);
+                    trace!(
+                        message = "PartitionedBatcher: item pushed.",
+                        new_batch_len = batch.len(),
+                        batch_full = batch.is_batch_full(),
+                    );
                     if batch.is_batch_full() {
+                        debug!(
+                            message = "PartitionedBatcher: partition batch full after push, closing and removing timer.",
+                            batch_len = batch.len(),
+                        );
                         // If the insertion means the batch is now full, we clear out the batch and
                         // remove it from the list.
                         this.closed_batches

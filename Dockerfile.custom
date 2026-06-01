@@ -1,0 +1,23 @@
+FROM docker.io/debian:trixie-slim
+
+LABEL org.opencontainers.image.url="https://vector.dev"
+LABEL org.opencontainers.image.source="https://github.com/vectordotdev/vector"
+LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
+LABEL org.opencontainers.image.version="0.56.0"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tzdata \
+    zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/vector /var/lib/vector /usr/share/vector
+
+COPY .build-stage/vector /usr/bin/vector
+
+
+RUN ["vector", "--version"]
+
+VOLUME /var/lib/vector
+
+ENTRYPOINT ["/usr/bin/vector"]

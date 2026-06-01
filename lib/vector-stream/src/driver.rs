@@ -86,6 +86,11 @@ where
     pub async fn run(self) -> Result<(), ()> {
         let mut in_flight = FuturesUnorderedCount::new();
         let mut next_batch: Option<VecDeque<St::Item>> = None;
+        // Overflow slot: allows batched_input to be polled (keeping timer wakers alive)
+        // even while next_batch is occupied and waiting for service readiness.
+        // Without this, a timeout-triggered batch whose timer fires while next_batch
+        // is held stalls until the current in-flight request completes.
+        let mut overflow_batch: Option<VecDeque<St::Item>> = None;
         let mut seq_num = 0usize;
 
         let Self {
@@ -182,11 +187,24 @@ where
 
                         in_flight.push(fut);
                     }
+
+                    // Batch fully drained — promote overflow into the primary slot so the
+                    // next iteration can send it and branch 3 becomes re-enabled.
+                    if next_batch.is_none() {
+                        next_batch = overflow_batch.take();
+                    }
                 }
 
                 // We've received some items from the input stream.
-                Some(reqs) = batched_input.next(), if next_batch.is_none() => {
-                    next_batch = Some(reqs.into());
+                // Guard on overflow_batch (not next_batch) so batched_input is always
+                // polled while we have only one batch queued, keeping timer wakers alive.
+                Some(reqs) = batched_input.next(), if overflow_batch.is_none() => {
+                    let batch: VecDeque<St::Item> = reqs.into();
+                    if next_batch.is_none() {
+                        next_batch = Some(batch);
+                    } else {
+                        overflow_batch = Some(batch);
+                    }
                 }
 
                 else => break

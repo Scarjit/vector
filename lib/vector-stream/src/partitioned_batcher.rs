@@ -267,6 +267,17 @@ where
         let mut this = self.project();
         loop {
             if !this.closed_batches.is_empty() {
+                // Poll the timer so its waker is registered even when returning early.
+                // Without this, a timer reset in the !fits path fires with no waker
+                // and the lone batch stalls until the next event.
+                match this.timer.poll_expired(cx) {
+                    Poll::Ready(Some(item_key)) => {
+                        if let Some(mut batch) = this.batches.remove(&item_key) {
+                            this.closed_batches.push((item_key, batch.take_batch()));
+                        }
+                    }
+                    Poll::Pending | Poll::Ready(None) => {}
+                }
                 return Poll::Ready(this.closed_batches.pop());
             }
             match this.stream.as_mut().poll_next(cx) {

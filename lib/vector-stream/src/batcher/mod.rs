@@ -84,6 +84,14 @@ where
                         this.state.push(item, item_metadata);
                         this.timer
                             .set(Maybe::Some(tokio::time::sleep(this.state.timeout())));
+                        // Poll the new timer immediately so its waker is registered with
+                        // Tokio's timer wheel before we return.  Without this, if the
+                        // caller takes longer than timeout to call poll_next again (e.g.
+                        // due to downstream backpressure), the timer fires with no waker
+                        // registered and the lone batch stalls until the next event.
+                        if let MaybeProj::Some(timer) = this.timer.as_mut().project() {
+                            let _ = timer.poll(cx);
+                        }
                         return output;
                     }
                 }

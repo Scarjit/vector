@@ -1,3 +1,6 @@
+# Build artifacts
+.build-stage/vector
+
 # Rust
 cargo-timing*.html
 **/*.rs.bk
@@ -71,3 +74,5 @@ local/
 
 # vscode
 .vscode/
+
+*.zip

@@ -13,3 +13,6 @@
 
 # Exclude target directories to avoid copying build artifacts
 target
+
+# Custom build staging area (used by Dockerfile.custom)
+!.build-stage
